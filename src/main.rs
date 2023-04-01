@@ -8,8 +8,11 @@ use reqwest::{Client, RequestBuilder, StatusCode};
 use reqwest_eventsource::{Event, EventSource};
 use rustyline::error::ReadlineError;
 use rustyline::{DefaultEditor, Editor};
+use serde::Serialize;
+use serde_json::json;
+use std::fs::OpenOptions;
 use std::io::Write;
-
+use std::path::PathBuf;
 mod model;
 mod spinner;
 
@@ -17,7 +20,7 @@ use model::*;
 use spinner::Spinner;
 
 /// Command-line options
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Serialize)]
 #[command(about, long_about = None, trailing_var_arg=true)]
 struct Options {
     /// Whether to use streaming API
@@ -27,6 +30,14 @@ struct Options {
     /// The model to query
     #[arg(long, default_value_t = String::from("gpt-3.5-turbo"))]
     pub model: String,
+
+    // Whether to log query & response
+    #[arg(
+        long,
+        hide_short_help = true,
+        long_help = r#"Record queries & responses to the log."#
+    )]
+    pub log: bool,
 
     /// Sampling temperature to use, between 0 and 2.
     #[arg(
@@ -107,10 +118,19 @@ struct Session {
 
     /// Spinner holder
     spinner: Option<Spinner>,
+
+    /// Path to store log file
+    log_file_path: Option<PathBuf>,
 }
 
 impl Session {
     pub fn new(options: Options, api_key: String, api_base: String, is_stdout: bool) -> Self {
+        let log_file_path = if options.log {
+            compute_log_file_path()
+        } else {
+            None
+        };
+
         Self {
             options,
             api_key,
@@ -118,6 +138,7 @@ impl Session {
             is_stdout,
             messages: Vec::new(),
             spinner: None,
+            log_file_path,
         }
     }
 
@@ -141,7 +162,12 @@ impl Session {
             content: prompt,
         });
 
-        let _ = self.complete_and_print().await?;
+        let response = self.complete_and_print().await?;
+
+        if self.options.log {
+            self.log_message(&response).unwrap();
+        }
+
         Ok(())
     }
 
@@ -188,7 +214,12 @@ impl Session {
             });
 
             match self.complete_and_print().await {
-                Ok(response) => self.messages.push(response),
+                Ok(response) => {
+                    self.messages.push(response.clone());
+                    if self.options.log {
+                        self.log_message(&response).unwrap();
+                    }
+                }
                 Err(err) => {
                     let last_msg = self.messages.pop(); // remove the last message
                     assert!(last_msg.is_some());
@@ -398,4 +429,36 @@ impl Session {
             Ok(())
         }
     }
+
+    fn log_message(&self, message: &Message) -> Result<()> {
+        if let Some(log_file_path) = &self.log_file_path {
+            let mut file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(log_file_path)?;
+            let log_entry = json!({
+                "time": chrono::Utc::now().to_rfc3339(),
+                "prompt": self.options.prompt.join(" "),
+                "content": message.content,
+                "role": message.role,
+                "options": {
+                    "no_stream": self.options.no_stream,
+                    "model": self.options.model,
+                    "log": self.options.log,
+                    "temperature": self.options.temperature,
+                    "top_p": self.options.top_p,
+                    "system": self.options.system
+                }
+            });
+            writeln!(file, "{}", log_entry)?;
+        }
+        Ok(())
+    }
+}
+
+fn compute_log_file_path() -> Option<PathBuf> {
+    let xdg_dirs = xdg_basedir::get_data_home().ok()?;
+    let log_dir = xdg_dirs.join("heygpt");
+    std::fs::create_dir_all(&log_dir).ok()?;
+    Some(log_dir.join("log.jsonl"))
 }
